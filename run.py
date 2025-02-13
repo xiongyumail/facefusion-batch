@@ -4,135 +4,120 @@ import sys
 import threading
 from glob import glob
 
-# 配置目录路径
+# 常量配置
+MIN_SIZE = 10 * 1024  # 10KB
+BASE_PATHS = {
+    'source': ('data', 'source'),
+    'target': ('data', 'target'),
+    'output': ('data', 'output'),
+    'config': ('config', 'facefusion.ini')
+}
+EXTENSIONS = {
+    'source': {'.jpg', '.jpeg', '.png'},
+    'target': {'.jpg', '.jpeg', '.png', '.mp4'}
+}
+
+# 初始化工作目录
 os.chdir("./facefusion")
+base_dir = lambda *p: os.path.join(".assets", *p)
+dirs = {k: base_dir(*v) for k, v in BASE_PATHS.items()}
+dirs.update({'assets': base_dir()})
 
-assets = os.path.abspath(".assets")
-config = os.path.abspath(os.path.join(assets, "config"))
-source = os.path.abspath(os.path.join(assets, "data", "source"))
-target = os.path.abspath(os.path.join(assets, "data", "target"))
-output = os.path.abspath(os.path.join(assets, "data", "output"))
-print(f"assets path: {assets}")
-print(f"source path: {source}")
-print(f"target path: {target}")
-print(f"output path: {output}")
+# 打印路径信息
+print("系统路径配置：")
+for k in ['assets', 'source', 'target', 'output', 'config']:
+    print(f"{k.upper():<8}: {dirs[k]}")
 
-config_path = os.path.join(config, "facefusion.ini")
-print(f"Config path: {config_path}")
+# 验证必要目录
+missing = [k for k in ('source', 'target') if not os.path.exists(dirs[k])]
+if missing:
+    sys.exit(f"错误：缺失必要目录: {', '.join(missing)}")
 
-# 验证参数是否已设置
-if not all([source, target, output]):
-    print("Error: source, target, and output directories must be provided.")
-    exit(1)
+def validate_file(path, exts, min_size):
+    return os.path.splitext(path)[1].lower() in exts and os.path.getsize(path) >= min_size
 
-# 获取源文件列表
-source_files = glob(os.path.join(source, "*"))
-source_files = [f for f in source_files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-print(f"source_files: {source_files}")
+def scan_files(folder, exts, min_size, group_subdirs=False):
+    found = {}
+    for root, _, files in os.walk(folder):
+        rel_path = os.path.relpath(root, folder)
+        group = rel_path if group_subdirs and rel_path != "." else "main"
+        valid = [os.path.join(root, f) for f in files 
+                if validate_file(os.path.join(root, f), exts, min_size)]
+        if valid:
+            found.setdefault(group, []).extend(valid)
+    return found
 
-# 获取目标文件列表
-target_files = glob(os.path.join(target, "*"))
-target_files = [f for f in target_files if f.lower().endswith(('.mp4', '.png', '.jpg', '.jpeg'))]
-print(f"target_files: {target_files}")
+# 收集文件数据
+source_data = scan_files(dirs['source'], EXTENSIONS['source'], MIN_SIZE, True)
+target_data = scan_files(dirs['target'], EXTENSIONS['target'], MIN_SIZE)
 
-def run_command(command):
-    command = ['python', 'facefusion.py'] + command
-    print(f"command: {command}")
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1  # 行缓冲
-    )
+# 打印文件统计
+def show_stats(data, name):
+    print(f"\n{name}文件分布：")
+    for group, files in data.items():
+        print(f"{group:<15}: {len(files):>3} 文件")
 
-    stdout_lines = []
-    stderr_lines = []
+show_stats(source_data, "源")
+show_stats(target_data, "目标")
 
-    def read_stream(stream, buffer, is_stderr):
+def execute(cmd):
+    """执行命令并实时输出"""
+    full_cmd = ['python', 'facefusion.py'] + cmd
+    print("\n▶ 执行命令:", ' '.join(full_cmd))
+    
+    process = subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                              text=True, bufsize=1)
+
+    def stream_reader(stream, prefix):
         while True:
             line = stream.readline()
             if not line:
                 break
-            buffer.append(line)
-            if is_stderr:
-                print(line, end='', file=sys.stderr)
-            else:
-                print(line, end='')
+            print(f"{prefix}{line}", end='')
 
-    # 启动线程读取输出
-    stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines, False))
-    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, True))
+    threads = [
+        threading.Thread(target=stream_reader, args=(process.stdout, "")),
+        threading.Thread(target=stream_reader, args=(process.stderr, ""))
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
 
-    stdout_thread.start()
-    stderr_thread.start()
+    if process.wait() != 0:
+        print("命令执行异常")
 
-    # 等待进程结束
-    process.wait()
+def process_jobs():
+    """主处理流程"""
+    execute(['job-delete-all'])
 
-    # 确保线程结束
-    stdout_thread.join()
-    stderr_thread.join()
+    for group, sources in source_data.items():
+        output_dir = os.path.join(dirs['output'], group)
+        os.makedirs(output_dir, exist_ok=True)
 
-    # 合并输出内容
-    stdout_str = ''.join(stdout_lines)
-    stderr_str = ''.join(stderr_lines)
+        execute(['job-create', group])
+        
+        for target in target_data.get('main', []):
+            output = os.path.join(output_dir, os.path.basename(target))
+            cmd = [
+                'job-add-step', group,
+                '--config-path', dirs['config'],
+                '-s', *sources,
+                '-t', target,
+                '-o', output
+            ]
+            execute(cmd)
 
-    if process.returncode != 0:
-        print("\n命令执行失败。")
-        print(f"错误详情：\n{stderr_str}")
+        execute(['job-submit', group])
 
-command = ['job-delete-all']
-run_command(command)
+    # 启动任务执行
+    execute([
+        'job-run-all',
+        '--execution-providers', 'openvino',
+        '--execution-device-id', '0',
+        '--execution-thread-count', '32',
+        '--execution-queue-count', '2',
+        '--video-memory-strategy', 'tolerant',
+        '--system-memory-limit', '0'
+    ])
 
-# 遍历源文件夹中的所有文件
-for source_file_path in source_files:
-    # 提取源文件名（不含扩展名）
-    source_file_base = os.path.basename(source_file_path)
-    source_file_name = os.path.splitext(source_file_base)[0]
-
-    # 构造输出路径并验证其安全性
-    output_path = os.path.join(output, source_file_name)
-    os.makedirs(output_path, exist_ok=True)
-
-    # 获取目标文件总数
-    total_files = len(target_files)
-
-    command = ['job-create', source_file_name]
-    run_command(command)
-
-    # 遍历目标文件列表
-    for i, target_file_path in enumerate(target_files):
-        target_file_base = os.path.basename(target_file_path)
-        target_file_name = os.path.splitext(target_file_base)[0]
-
-        output_file_path = os.path.join(output_path, target_file_base)
-
-        # 打印当前进度
-        print(f"Processing file {i + 1} of {total_files}: {source_file_path} with {target_file_path} to {output_file_path}")
-
-        # 调用 Python 脚本并检查其返回值
-        # 执行命令
-        command = [
-            'job-add-step', source_file_name,
-            '--config-path', config_path,
-            '-s', source_file_path,
-            '-t', target_file_path,
-            '-o', output_file_path
-        ]
-
-        run_command(command)
-
-    command = ['job-submit', source_file_name]
-    run_command(command)
-
-command = [
-    'job-run-all',
-    '--execution-providers', 'openvino',
-    '--execution-device-id', '0',
-    '--execution-thread-count', '32',
-    '--execution-queue-count', '2',
-    '--video-memory-strategy', 'tolerant', # warmup
-    '--system-memory-limit', '0'
-]
-run_command(command)
+if __name__ == "__main__":
+    process_jobs()
