@@ -96,10 +96,16 @@ def process_jobs():
         execute(['job-create', group])
         
         for target in target_data.get('main', []):
+            # 判断 target 是否是 mp4 文件
+            if target.endswith('.mp4'):
+                pixel_size = '128x128'
+            else:
+                pixel_size = '512x512'
             output = os.path.join(output_dir, os.path.basename(target))
             cmd = [
                 'job-add-step', group,
                 '--config-path', dirs['config'],
+                '--face-swapper-pixel-boost', pixel_size,
                 '-s', *sources,
                 '-t', target,
                 '-o', output
