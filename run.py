@@ -3,9 +3,12 @@ import subprocess
 import sys
 import threading
 from glob import glob
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 # 常量配置
 MIN_SIZE = 10 * 1024  # 10KB
+JOB_MAX_TARGET = 10
 BASE_PATHS = {
     'source': ('data', 'source'),
     'target': ('data', 'target'),
@@ -42,7 +45,7 @@ def scan_files(folder, exts, min_size, group_subdirs=False):
         rel_path = os.path.relpath(root, folder)
         group = rel_path if group_subdirs and rel_path != "." else "main"
         valid = [os.path.join(root, f) for f in files 
-                if validate_file(os.path.join(root, f), exts, min_size)]
+                 if validate_file(os.path.join(root, f), exts, min_size)]
         if valid:
             found.setdefault(group, []).extend(valid)
     return found
@@ -66,7 +69,7 @@ def execute(cmd):
     print("\n▶ 执行命令:", ' '.join(full_cmd))
     
     process = subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                              text=True, bufsize=1)
+                               text=True, bufsize=1)
 
     def stream_reader(stream, prefix):
         while True:
@@ -84,38 +87,54 @@ def execute(cmd):
 
     if process.wait() != 0:
         print("命令执行异常")
+    return process.returncode
+
+def process_batch(job_name, sources, target_batch, output_dir, config_path):
+    execute(['job-create', job_name])
+    for target in target_batch:
+        # 判断 target 是否是 mp4 文件
+        if target.endswith('.mp4'):
+            pixel_size = '128x128'
+        else:
+            pixel_size = '512x512'
+        output = os.path.join(output_dir, os.path.basename(target))
+        cmd = [
+            'job-add-step', job_name,
+            '--config-path', config_path,
+            '--face-swapper-pixel-boost', pixel_size,
+            '-s', *sources,
+            '-t', target,
+            '-o', output
+        ]
+        execute(cmd)
+    execute(['job-submit', job_name])
 
 def process_jobs():
     """主处理流程"""
     execute(['job-delete-all'])
 
-    for group, sources in source_data.items():
-        output_dir = os.path.join(dirs['output'], group)
-        os.makedirs(output_dir, exist_ok=True)
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for group, sources in source_data.items():
+            output_dir = os.path.join(dirs['output'], group)
+            os.makedirs(output_dir, exist_ok=True)
 
-        execute(['job-create', group])
-        
-        for target in target_data.get('main', []):
-            # 判断 target 是否是 mp4 文件
-            if target.endswith('.mp4'):
-                pixel_size = '128x128'
-            else:
-                pixel_size = '512x512'
-            output = os.path.join(output_dir, os.path.basename(target))
-            cmd = [
-                'job-add-step', group,
-                '--config-path', dirs['config'],
-                '--face-swapper-pixel-boost', pixel_size,
-                '-s', *sources,
-                '-t', target,
-                '-o', output
-            ]
-            execute(cmd)
+            # 拆分 target 列表为更小的批次
+            targets = target_data.get('main', [])
+            for i in range(0, len(targets), JOB_MAX_TARGET):
+                target_batch = targets[i:i + JOB_MAX_TARGET]
+                # 为每个批次创建一个唯一的任务名称
+                job_name = f"{group}_{i // JOB_MAX_TARGET}"
 
-        execute(['job-submit', group])
+                future = executor.submit(process_batch, job_name, sources, target_batch, output_dir, dirs['config'])
+                futures.append(future)
+
+        # 等待所有批次处理完成
+        for future in futures:
+            future.result()
 
     # 启动任务执行
-    execute([
+    job_run_all_cmd = [
         'job-run-all',
         '--execution-providers', 'openvino',
         '--execution-device-id', '0',
@@ -123,7 +142,14 @@ def process_jobs():
         '--execution-queue-count', '2',
         '--video-memory-strategy', 'tolerant',
         '--system-memory-limit', '0'
-    ])
+    ]
+
+    start_time = time.time()
+    execute(job_run_all_cmd)
+    end_time = time.time()
+
+    elapsed_time = end_time - start_time
+    print(f"\njob-run-all 命令执行时间: {elapsed_time:.2f} 秒")
 
 if __name__ == "__main__":
     process_jobs()
