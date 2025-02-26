@@ -8,7 +8,7 @@ import time
 
 # 常量配置
 MIN_SIZE = 10 * 1024  # 10KB
-JOB_MAX_TARGET = 10
+JOB_MAX_TARGET = 100 #建议配置大一些，太小会有多线程 job_submit 没有提交问题。
 BASE_PATHS = {
     'source': ('data', 'source'),
     'target': ('data', 'target'),
